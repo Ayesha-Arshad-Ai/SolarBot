@@ -5,3 +5,5 @@ pydantic
 geopy
 requests
 openai
+groq
+gunicorn
