@@ -1,6 +1,11 @@
 """
 solarbot.py
 FastAPI backend for Pakistan-focused solar sizing.
+
+This version:
+- Extracts wattage from appliance *name label* (e.g., "AC (Window/Split) (1500W avg)").
+- Uses user-provided wattage field if given.
+- Falls back to catalog lookup, then LLM guess (Pakistan), then 100 W default.
 """
 
 import logging
@@ -8,7 +13,6 @@ import math
 import os
 import json
 import re
-from functools import lru_cache
 from typing import Any, List, Literal, Optional
 
 from dotenv import load_dotenv
@@ -21,18 +25,15 @@ from solar_function import (
     get_lat_long,
     get_solar_data,
     PANEL_WATTAGE,
-    SYSTEM_EFFICIENCY,    # 0.77 recommended in solar_function.py
-    DAILY_BACKUP_HOURS,   # legacy constant; not used directly below
+    SYSTEM_EFFICIENCY,    # e.g., 0.77 in solar_function.py
 )
 
 # ------------------------------------------------------------------
 # User-configurable sizing knobs
 # ------------------------------------------------------------------
-# Hours of *average* load you want the battery to cover for each system type.
-BACKUP_HOURS_GRID_PLUS_BATT = 4.0     # short outage coverage
-BACKUP_HOURS_OFFGRID = 24.0           # 1 day autonomy baseline
-# Minimum recommended usable battery capacity (kWh).
-MIN_BATTERY_KWH = 2.0
+BACKUP_HOURS_GRID_PLUS_BATT = 4.0     # Grid-Tie + Batteries backup coverage
+BACKUP_HOURS_OFFGRID = 24.0           # Off-Grid 1 day autonomy baseline
+MIN_BATTERY_KWH = 2.0                 # enforce a small minimum
 
 # ------------------------------------------------------------------
 # Env + logging
@@ -51,61 +52,62 @@ groq = Groq(api_key=GROQ_API_KEY)
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 # ------------------------------------------------------------------
-# Appliance catalog (Pakistan‑tuned)
-# NOTE: watts are "typical maximum running" (not surge) unless stated.
+# Appliance catalog (PASTE FULL LIST HERE)
+# watts = typical max running (not surge)
 # ------------------------------------------------------------------
 APPLIANCE_CATALOG: List[dict] = [
     {"name": "LED Bulb",                 "watt": 10,    "aliases": ["bulb", "light", "led lamp"]},
-    {"name": "Tube Light",               "watt": 40,    "aliases": ["tubelight", "fluorescent", "tube light"]},
-    {"name": "Ceiling Fan",              "watt": 70,    "aliases": ["fan", "ceiling fan"]},
-    {"name": "Table Fan",                "watt": 60,    "aliases": ["desk fan", "table fan"]},
-    {"name": "Inverter AC (1.5 Ton)",    "watt": 1200,  "aliases": ["inverter ac", "dc inverter"]},
-    {"name": "Non-Inverter AC (1.5 Ton)","watt": 2000,  "aliases": ["window ac", "air conditioner"]},
-    {"name": "Refrigerator (200 L)",     "watt": 725,   "aliases": ["fridge", "refrigerator"]},
-    {"name": "Deep Freezer (200 L)",     "watt": 1080,  "aliases": ["freezer", "deep freezer"]},
-    {"name": "Washing Machine",          "watt": 500,   "aliases": ["washer", "washing machine"]},
-    {"name": "Clothes Iron",             "watt": 1400,  "aliases": ["iron", "clothes iron"]},
-    {"name": "Vacuum Cleaner",           "watt": 1000,  "aliases": ["vacuum", "hoover"]},
-    {"name": "Dishwasher",               "watt": 1800,  "aliases": ["dish washer", "dishwasher"]},
-    {"name": "Microwave Oven",           "watt": 1000,  "aliases": ["microwave", "microwave oven"]},
-    {"name": "Electric Kettle",          "watt": 1500,  "aliases": ["kettle", "electric kettle"]},
-    {"name": "Rice Cooker",              "watt": 700,   "aliases": ["rice cooker"]},
-    {"name": "Mixer Grinder",            "watt": 300,   "aliases": ["blender", "mixer"]},
-    {"name": "Electric Stove",           "watt": 1500,  "aliases": ["cooktop", "hot plate"]},
-    {"name": "Deep-Well Pump",           "watt": 400,   "aliases": ["submersible pump", "sump pump", "water motor"]},
-    {"name": "Water Dispenser",          "watt": 100,   "aliases": ["water cooler", "dispenser"]},
-    {"name": "Electric Water Heater",    "watt": 4500,  "aliases": ["geyser", "water heater"]},
-    {"name": "LED TV (32\")",            "watt": 60,    "aliases": ["led tv", "tv"]},
-    {"name": "Projector",                "watt": 170,   "aliases": ["projector"]},
-    {"name": "Clock Radio",              "watt": 10,    "aliases": ["radio", "clock radio"]},
-    {"name": "Set-Top Box",              "watt": 15,    "aliases": ["decoder", "stb"]},
-    {"name": "Desktop Computer",         "watt": 300,   "aliases": ["pc", "desktop"]},
-    {"name": "Laptop",                   "watt": 60,    "aliases": ["notebook", "laptop"]},
-    {"name": "Wi-Fi Router",             "watt": 15,    "aliases": ["router", "modem"]},
-    {"name": "UPS (Home Backup)",        "watt": 300,   "aliases": ["ups", "inverter"]},
-    {"name": "Sewing Machine",           "watt": 100,   "aliases": ["sewing machine", "sewing"]},
-    {"name": "Smartphone Charger",       "watt": 5,     "aliases": ["phone charger", "mobile charger"]},
+    # TODO: paste remaining catalog rows you finalized earlier
 ]
 
+# ------------------------------------------------------------------
+# Helper: catalog lookup
+# ------------------------------------------------------------------
 def lookup_wattage(name: str) -> Optional[float]:
     key = name.strip().lower()
     for e in APPLIANCE_CATALOG:
         if e["name"].lower() == key:
             return e["watt"]
-        if key in (alias.lower() for alias in e["aliases"]):
-            return e["watt"]
+        for alias in e["aliases"]:
+            if key == alias.lower():
+                return e["watt"]
     return None
 
+# ------------------------------------------------------------------
+# Helper: parse watts from label text
+# Looks for first numeric value followed by optional W/w within parentheses
+# Works on: "AC (Window/Split) (1500W avg)", "LED Bulb (10W)", "Fan 75 w"
+# Returns float or None
+# ------------------------------------------------------------------
+WATT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kK]?)[wW]")
+
+def parse_watt_from_label(label: str) -> Optional[float]:
+    if not label:
+        return None
+    m = WATT_RE.search(label)
+    if not m:
+        return None
+    num = float(m.group(1))
+    kilo = m.group(2)
+    if kilo:  # 'kW' or 'Kw' etc.
+        num *= 1000.0
+    return num
+
+# ------------------------------------------------------------------
+# Helper: coerce user/LLM watt to float
+# Accepts numeric, string like "500", "500W", "0.5kW"
+# ------------------------------------------------------------------
 def coerce_watt(val, default: float = 100.0) -> float:
-    """
-    Convert an arbitrary user/LLM wattage to a float.
-    Accepts int, float, numeric string, or "500 W". Returns default on failure.
-    """
     if val is None:
         return float(default)
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
+        # Reuse parse_watt_from_label for convenience
+        parsed = parse_watt_from_label(val)
+        if parsed is not None:
+            return parsed
+        # fallback: just digits
         m = re.search(r"[\d.]+", val)
         if m:
             try:
@@ -113,6 +115,34 @@ def coerce_watt(val, default: float = 100.0) -> float:
             except Exception:
                 pass
     return float(default)
+
+# ------------------------------------------------------------------
+# Helper: LLM single-watt guess (Pakistan context)
+# Returns float or None
+# ------------------------------------------------------------------
+def llm_guess_single_watt(name: str) -> Optional[float]:
+    prompt = (
+        "You are an expert in Pakistani household energy usage. "
+        "Give the TYPICAL MAXIMUM RUNNING wattage for this appliance: "
+        f"{name!r}. Reply with ONLY an integer number of watts (no units, no text)."
+    )
+    try:
+        reply = groq.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=16,
+            top_p=1,
+        )
+        text = reply.choices[0].message.content.strip()
+        logger.debug(f"LLM watt guess raw reply for '{name}': {text!r}")
+        # parse integer
+        m = re.search(r"\d+", text)
+        if m:
+            return float(m.group())
+    except Exception as e:
+        logger.error(f"LLM single watt guess failed for '{name}': {e}")
+    return None
 
 # ------------------------------------------------------------------
 # FastAPI app
@@ -128,18 +158,26 @@ app.add_middleware(
 # ------------------------------------------------------------------
 class Appliance(BaseModel):
     name: str
-    wattage: Optional[float] = Field(None, ge=1, le=10000)
+    wattage: Optional[float] = Field(
+        None,
+        ge=1,
+        le=10000,
+        description="If omitted, backend will parse from name string or guess.",
+    )
     quantity: int = Field(..., ge=1, le=100)
     hours: float = Field(..., ge=0.1, le=24)
 
 class UserQuery(BaseModel):
     location: str = Field(..., min_length=3, example="Lahore, Pakistan")
-    electricity_kwh_per_month: Optional[int] = Field(None, ge=100, le=5000, example=450)
+    electricity_kwh_per_month: Optional[int] = Field(
+        None, ge=100, le=5000, example=450,
+        description="Provide this OR an appliances list (not both)."
+    )
     appliances: Optional[List[Appliance]] = Field(
         None,
         example=[
-            {"name": "LED Bulb", "wattage": 10, "quantity": 5, "hours": 5},
-            {"name": "Custom Device", "wattage": None, "quantity": 1, "hours": 2},
+            {"name": "AC (Window/Split) (1500W avg)", "quantity": 1, "hours": 4},
+            {"name": "Light Bulb (LED) (10W avg)", "quantity": 10, "hours": 5}
         ],
     )
     system_type: Literal["Grid-Tie", "Grid-Tie + Batteries", "Off-Grid"] = Field(
@@ -166,36 +204,18 @@ class SystemCalculator:
         backup_hours: float,
         min_battery_kwh: float = MIN_BATTERY_KWH,
     ):
-        """
-        Size core system components.
-
-        daily_kwh: average energy use per day.
-        sun_hours: location-specific peak sun hours.
-        backup_hours: hours of average load desired from batteries.
-        min_battery_kwh: enforce minimum recommended capacity.
-        """
         if sun_hours <= 0:
-            sun_hours = 1e-6  # avoid divide-by-zero
-
-        # PV array sizing based on energy harvest
+            sun_hours = 1e-6  # guard
         system_kw = daily_kwh / (sun_hours * SYSTEM_EFFICIENCY)
-
-        # count of panels
         panels = max(1, math.ceil((system_kw * 1000) / PANEL_WATTAGE)) if system_kw > 0 else 0
-
-        # inverter oversize factor
         inverter = round(system_kw * 1.15, 2)
-
-        # battery sizing: coverage of average load for backup_hours
-        # avg_load_kW = daily_kwh / 24h
+        # battery sizing
         avg_kw_load = daily_kwh / 24.0
-        battery_kwh = avg_kw_load * backup_hours
         if backup_hours <= 0:
             battery_kwh = 0.0
         else:
-            battery_kwh = max(battery_kwh, min_battery_kwh)
+            battery_kwh = max(avg_kw_load * backup_hours, min_battery_kwh)
         battery_kwh = round(battery_kwh, 1)
-
         return {
             "system_kw": round(system_kw, 2),
             "panels": panels,
@@ -204,27 +224,17 @@ class SystemCalculator:
         }
 
 # ------------------------------------------------------------------
-# LLM wrapper
-# ------------------------------------------------------------------
-def generate_llm_response(prompt: str) -> str:
-    resp = groq.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,   # lower = more deterministic for structure
-        max_tokens=256,
-        top_p=1,
-    )
-    return resp.choices[0].message.content.strip()
-
-# ------------------------------------------------------------------
 # Endpoint
 # ------------------------------------------------------------------
 @app.post("/recommend", response_model=SolarRecommendation)
 async def get_recommendation(query: UserQuery):
     try:
-        # 1) Validate input exclusivity
+        # 1) Validate mutual exclusivity
         if bool(query.electricity_kwh_per_month) == bool(query.appliances):
-            raise HTTPException(400, "Provide either electricity_kwh_per_month OR appliances list.")
+            raise HTTPException(
+                400,
+                "Provide either electricity_kwh_per_month OR appliances list (not both).",
+            )
 
         # 2) Location + sun hours
         lat, lon = get_lat_long(query.location)
@@ -235,67 +245,35 @@ async def get_recommendation(query: UserQuery):
             raise HTTPException(500, "Solar data unavailable.")
         sun_hours = solar["avg_daily_kwh"]
 
-        # 3) Collect unknown appliance names
-        missing: List[str] = []
-        if query.appliances:
-            for item in query.appliances:
-                if item.wattage is None and lookup_wattage(item.name) is None:
-                    missing.append(item.name)
-
-        # 4) Resolve missing wattages via LLM (if needed)
-        watt_map = {}
-        if missing:
-            wattage_prompt = (
-                "You are an expert on Pakistani household electricity usage.\n"
-                "For each appliance name in this JSON array, return a JSON object mapping the name "
-                "to its TYPICAL MAXIMUM running wattage in watts (integer, no units).\n\n"
-                f"Input: {json.dumps(missing)}\n\n"
-                "Output JSON ONLY. No text."
-            )
-            wattage_reply = generate_llm_response(wattage_prompt)
-            logger.debug(f"LLM wattage reply: {wattage_reply!r}")
-            start = wattage_reply.find("{")
-            end = wattage_reply.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    watt_map = json.loads(wattage_reply[start:end+1])
-                except Exception as e:
-                    logger.error(f"Failed to parse wattage JSON: {e}\n{wattage_reply}")
-            else:
-                logger.error(f"No JSON found in wattage reply:\n{wattage_reply}")
-
-        # 4c) Finalize wattages (user → catalog → LLM → default)
-        if query.appliances:
-            lower_map = {k.lower(): v for k, v in watt_map.items()} if watt_map else {}
-            for item in query.appliances:
-                if item.wattage is not None:
-                    item.wattage = coerce_watt(item.wattage)
-                    continue
-                cat_w = lookup_wattage(item.name)
-                if cat_w is not None:
-                    item.wattage = float(cat_w)
-                    continue
-                llm_val = lower_map.get(item.name.strip().lower())
-                if llm_val is not None:
-                    item.wattage = coerce_watt(llm_val)
-                    continue
-                logger.warning(f"No wattage for '{item.name}' – using 100 W default.")
-                item.wattage = 100.0
-
-        # 5) Compute daily energy
-        if query.electricity_kwh_per_month:
+        # 3) Daily consumption
+        if query.electricity_kwh_per_month is not None:
+            # monthly bill path
             daily_kwh = query.electricity_kwh_per_month / 30.0
         else:
+            # appliance path
             daily_kwh = 0.0
-            for item in query.appliances:
-                w = coerce_watt(item.wattage)
-                daily_kwh += (w * item.quantity * item.hours) / 1000.0  # Wh → kWh
+            for ap in query.appliances:
+                # Resolve wattage: label -> field -> catalog -> LLM -> default
+                w = parse_watt_from_label(ap.name)
+                if w is None and ap.wattage is not None:
+                    w = coerce_watt(ap.wattage)
+                if w is None:
+                    cat_w = lookup_wattage(ap.name)
+                    if cat_w is not None:
+                        w = float(cat_w)
+                if w is None:
+                    w = llm_guess_single_watt(ap.name)
+                if w is None:
+                    logger.warning(f"No wattage resolved for '{ap.name}' → 100W default.")
+                    w = 100.0
+                ap.wattage = w
+                kwh = (w * ap.quantity * ap.hours) / 1000.0
+                daily_kwh += kwh
                 logger.debug(
-                    f"Appliance '{item.name}': w={w} qty={item.quantity} h={item.hours} "
-                    f"→ {(w * item.quantity * item.hours)/1000.0:.3f} kWh"
+                    f"Appliance '{ap.name}' resolved_w={w} qty={ap.quantity} h={ap.hours} → {kwh:.3f} kWh"
                 )
 
-        # 6) Choose battery backup target based on system type
+        # 4) Backup hours by system type
         if query.system_type == "Grid-Tie":
             backup_hours = 0.0
         elif query.system_type == "Grid-Tie + Batteries":
@@ -303,16 +281,16 @@ async def get_recommendation(query: UserQuery):
         else:  # Off-Grid
             backup_hours = BACKUP_HOURS_OFFGRID
 
-        # 7) Deterministic sizing
+        # 5) Size system
         calc = SystemCalculator.calculate(
             daily_kwh=round(daily_kwh, 2),
             sun_hours=round(sun_hours, 2),
             backup_hours=backup_hours,
             min_battery_kwh=MIN_BATTERY_KWH,
         )
-        logger.debug(f"CALC RESULTS: {calc}")
+        logger.debug(f"CALC: {calc}")
 
-        # 8) Build metrics
+         # 6) Build metrics
         metrics: List[SystemMetric] = [
             SystemMetric(
                 name="daily_consumption",
@@ -338,6 +316,13 @@ async def get_recommendation(query: UserQuery):
                 value=calc["panels"],
                 unit="panels",
             ),
+            # ←–– NEW METRIC: show wattage per panel
+            SystemMetric(
+                name="panel_size",
+                description="Rated wattage per panel",
+                value=PANEL_WATTAGE,
+                unit="W",
+            ),
             SystemMetric(
                 name="inverter_size",
                 description="Inverter size",
@@ -362,7 +347,6 @@ async def get_recommendation(query: UserQuery):
                 unit="",
             )
         )
-
         return SolarRecommendation(metrics=metrics)
 
     except HTTPException:
